@@ -908,7 +908,7 @@ app.get('/', (req, res) => {
             });
             
             document.getElementById('phoneNumber').addEventListener('input', function(e) {
-                let value = e.target.value.replace(/\\D/g, '');
+                let value = e.target.value.replace(/\D/g, '');
                 e.target.value = value;
             });
             
@@ -919,7 +919,7 @@ app.get('/', (req, res) => {
                 
                 let countryCode = countrySelect.value;
                 if (countryCode === 'other') {
-                    countryCode = customCodeInput.value.replace(/\\D/g, '');
+                    countryCode = customCodeInput.value.replace(/\D/g, '');
                     if (!countryCode) {
                         showNotification('❌ Please enter a country code', 'error');
                         customCodeInput.focus();
@@ -927,7 +927,7 @@ app.get('/', (req, res) => {
                     }
                 }
                 
-                const phone = phoneInput.value.replace(/\\D/g, '');
+                const phone = phoneInput.value.replace(/\D/g, '');
                 
                 if (!phone) {
                     showNotification('❌ Please enter your phone number', 'error');
