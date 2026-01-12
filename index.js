@@ -1,122 +1,88 @@
-/**
- * IAN TECH WhatsApp Pairing Service
- * Replit AI Agent Compliant Version
- * Version: 3.0.0
- * 
- * COMPLIANCE NOTES:
- * 1. This service ONLY generates pairing codes for legitimate WhatsApp device linking
- * 2. No WhatsApp API interaction - only generates codes for user to enter manually
- * 3. No automated messaging or scraping
- * 4. Compliant with WhatsApp's Terms of Service
- * 5. Data privacy: Codes expire after 10 minutes, no permanent storage
- */
-
-// ==================== IMPORTS ====================
+// ==================== REQUIRED MODULES ====================
 const express = require('express');
+const helmet = require('helmet');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const { 
+    makeWASocket, 
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+    Browsers
+} = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 const crypto = require('crypto');
 const fs = require('fs-extra');
 const path = require('path');
+const pino = require('pino');
 const { parsePhoneNumberFromString } = require('libphonenumber-js');
 const phone = require('phone');
 
+// ==================== EXPRESS APP SETUP ====================
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ==================== COMPLIANCE CONFIGURATION ====================
+// Security middleware
+app.use(helmet());
+app.use(cors());
+app.use(rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100
+}));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static('public'));
+
+// Create public directory if it doesn't exist
+const publicDir = path.join(__dirname, 'public');
+fs.ensureDirSync(publicDir);
+
+// ==================== CONFIGURATION ====================
 const CONFIG = {
-    // Company Information
-    COMPANY_NAME: "IAN TECH",
-    COMPANY_CONTACT: "+254723278526",
-    COMPANY_EMAIL: "contact@iantech.co.ke",
-    COMPANY_WEBSITE: "https://iantech.co.ke",
-    
-    // Service Information
-    SERVICE_NAME: "WhatsApp Device Pairing Service",
-    SERVICE_DESCRIPTION: "Generates pairing codes for linking devices to WhatsApp",
-    SERVICE_VERSION: "3.0.0",
-    
-    // Compliance Information
-    TERMS_URL: "https://iantech.co.ke/terms",
-    PRIVACY_URL: "https://iantech.co.ke/privacy",
-    SUPPORT_URL: "https://iantech.co.ke/support",
-    COMPLIANCE_NOTICE: "This service complies with WhatsApp's Terms of Service and only generates pairing codes for legitimate device linking purposes.",
-    
-    // Service Configuration
+    COMPANY_NAME: process.env.COMPANY_NAME || "IAN TECH",
+    COMPANY_CONTACT: process.env.COMPANY_CONTACT || "+254723278526",
+    COMPANY_EMAIL: process.env.COMPANY_EMAIL || "contact@iantech.co.ke",
+    COMPANY_WEBSITE: process.env.COMPANY_WEBSITE || "https://iantech.co.ke",
+    SESSION_PREFIX: "IAN_TECH",
     LOGO_URL: "https://files.catbox.moe/f7f4r1.jpg",
     CODE_LENGTH: 8,
     CODE_EXPIRY_MINUTES: 10,
     DEFAULT_PHONE_EXAMPLE: "723278526",
+    VERSION: "2.1.0",
+    AUTHOR: "IAN TECH",
+    AUTO_ACTIVATED: true,
     MAX_SESSIONS: 100,
     CLEANUP_INTERVAL: 60000,
-    
-    // Security Configuration
-    RATE_LIMIT_WINDOW_MS: 900000, // 15 minutes
-    RATE_LIMIT_MAX_REQUESTS: 100,
-    MAX_REQUEST_SIZE: '10kb',
-    
-    // Data Privacy
-    DATA_RETENTION_MINUTES: 10,
-    NO_PERMANENT_STORAGE: true,
-    GDPR_COMPLIANT: true
+    CONNECTION_TIMEOUT: 30000,
+    MAX_QR_ATTEMPTS: 5
 };
 
 // ==================== GLOBAL STATE ====================
+let activeSocket = null;
+let currentQR = null;
+let qrImageDataUrl = null;
 let pairingCodes = new Map();
+let botStatus = 'disconnected';
 let lastGeneratedCode = null;
 let lastGeneratedDisplayCode = null;
-let serviceStatus = 'online';
-let totalCodesGenerated = 0;
-let serviceStartTime = new Date();
-
-// ==================== SECURITY MIDDLEWARE ====================
-const rateLimitStore = new Map();
-
-const securityMiddleware = (req, res, next) => {
-    // Security headers
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('X-XSS-Protection', '1; mode=block');
-    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    
-    // Rate limiting
-    const ip = req.ip || req.connection.remoteAddress;
-    const now = Date.now();
-    const windowStart = now - CONFIG.RATE_LIMIT_WINDOW_MS;
-    
-    if (!rateLimitStore.has(ip)) {
-        rateLimitStore.set(ip, []);
-    }
-    
-    const requests = rateLimitStore.get(ip).filter(time => time > windowStart);
-    requests.push(now);
-    rateLimitStore.set(ip, requests);
-    
-    if (requests.length > CONFIG.RATE_LIMIT_MAX_REQUESTS) {
-        return res.status(429).json({
-            success: false,
-            message: 'Too many requests. Please wait before making more requests.',
-            retryAfter: Math.ceil((requests[0] + CONFIG.RATE_LIMIT_WINDOW_MS - now) / 1000)
-        });
-    }
-    
-    next();
-};
+let autoActivationAttempts = 0;
+let isConnecting = false;
+let connectionStartTime = null;
+let lastConnectionUpdate = null;
 
 // ==================== UTILITY FUNCTIONS ====================
 function generateAlphanumericCode() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let code = '';
     
-    for (let i = 0; i < CONFIG.CODE_LENGTH; i++) {
+    for (let i = 0; i < 8; i++) {
         code += chars.charAt(Math.floor(Math.random() * chars.length));
     }
     
-    // Ensure code has both letters and numbers for security
-    const hasLetters = /[A-Z]/.test(code);
-    const hasNumbers = /[0-9]/.test(code);
+    const letterCount = (code.match(/[A-Z]/g) || []).length;
+    const numberCount = (code.match(/[0-9]/g) || []).length;
     
-    if (!hasLetters || !hasNumbers) {
+    if (letterCount < 2 || numberCount < 2) {
         return generateAlphanumericCode();
     }
     
@@ -130,73 +96,308 @@ function formatDisplayCode(code) {
     return code;
 }
 
+function generateSessionId() {
+    return `${CONFIG.SESSION_PREFIX}_${Date.now()}_${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+}
+
 function validateAndFormatPhoneNumber(phoneNumber) {
     try {
-        if (!phoneNumber || typeof phoneNumber !== 'string') {
+        let cleanNumber = phoneNumber.toString().trim().replace(/[^\d+]/g, '');
+        
+        if (cleanNumber.startsWith('0') && cleanNumber.length >= 9) {
+            cleanNumber = '+254' + cleanNumber.substring(1);
+        } else if (!cleanNumber.startsWith('+') && cleanNumber.length >= 9) {
+            cleanNumber = '+' + cleanNumber;
+        }
+        
+        const parsed = parsePhoneNumberFromString(cleanNumber);
+        if (parsed && parsed.isValid()) {
             return {
-                isValid: false,
-                error: 'Phone number is required',
-                code: 'PHONE_REQUIRED'
+                isValid: true,
+                formatted: parsed.number,
+                international: parsed.formatInternational(),
+                countryCode: parsed.countryCallingCode,
+                country: parsed.country || 'Unknown',
+                nationalNumber: parsed.nationalNumber,
+                rawNumber: cleanNumber,
+                source: 'libphonenumber'
             };
         }
         
-        let cleanNumber = phoneNumber.trim();
-        cleanNumber = cleanNumber.replace(/[^\d+]/g, '');
-        
-        // Basic validation
-        const digitsOnly = cleanNumber.replace(/\D/g, '');
-        
-        if (digitsOnly.length < 8 || digitsOnly.length > 15) {
+        const phoneResult = phone(cleanNumber);
+        if (phoneResult.isValid) {
             return {
-                isValid: false,
-                error: 'Phone number must be between 8 and 15 digits',
-                code: 'INVALID_LENGTH'
+                isValid: true,
+                formatted: phoneResult.phoneNumber,
+                international: phoneResult.phoneNumber,
+                countryCode: phoneResult.countryCode,
+                country: phoneResult.countryIso2 || 'Unknown',
+                nationalNumber: phoneResult.phoneNumber.replace(`+${phoneResult.countryCode}`, ''),
+                rawNumber: cleanNumber,
+                source: 'phone'
             };
         }
         
-        if (!/^\d+$/.test(digitsOnly)) {
-            return {
-                isValid: false,
-                error: 'Phone number must contain only digits',
-                code: 'INVALID_CHARACTERS'
-            };
-        }
-        
-        // Format as international number
-        const formattedNumber = `+${digitsOnly}`;
-        
-        return {
-            isValid: true,
-            formatted: formattedNumber,
-            country: 'Unknown',
-            rawNumber: cleanNumber,
-            code: 'VALID'
+        return { 
+            isValid: false, 
+            error: 'Invalid phone number format. Please use format: 723278526 or +254723278526' 
         };
         
     } catch (error) {
-        return {
-            isValid: false,
-            error: 'Phone validation error: ' + error.message,
-            code: 'VALIDATION_ERROR'
+        console.error('Phone validation error:', error);
+        return { 
+            isValid: false, 
+            error: 'Validation error: ' + error.message 
         };
+    }
+}
+
+function cleanupExpiredCodes() {
+    const now = new Date();
+    let cleaned = 0;
+    
+    for (const [code, data] of pairingCodes.entries()) {
+        if (data.expiresAt && new Date(data.expiresAt) < now && data.status === 'pending') {
+            pairingCodes.delete(code);
+            cleaned++;
+        }
+    }
+    
+    if (cleaned > 0) {
+        console.log(`🗑️ Cleaned ${cleaned} expired pairing codes`);
+    }
+    
+    if (pairingCodes.size > CONFIG.MAX_SESSIONS) {
+        const entries = Array.from(pairingCodes.entries());
+        const sorted = entries.sort((a, b) => new Date(a[1].createdAt) - new Date(b[1].createdAt));
+        const toRemove = sorted.slice(0, pairingCodes.size - CONFIG.MAX_SESSIONS);
+        
+        toRemove.forEach(([code]) => pairingCodes.delete(code));
+        console.log(`📉 Limited to ${CONFIG.MAX_SESSIONS} sessions, removed ${toRemove.length} oldest`);
     }
 }
 
 function getStatusColor(status) {
     switch(status) {
         case 'online': return '#28a745';
-        case 'maintenance': return '#ffc107';
-        case 'offline': return '#dc3545';
+        case 'qr_ready': return '#ffc107';
+        case 'connecting': return '#17a2b8';
+        case 'disconnected': return '#dc3545';
         default: return '#6c757d';
     }
 }
 
 function getStatusText(status) {
     switch(status) {
-        case 'online': return '✅ SERVICE ONLINE';
-        case 'maintenance': return '🛠️ MAINTENANCE MODE';
-        case 'offline': return '🔴 SERVICE OFFLINE';
-        default: return '⚙️ UNKNOWN STATUS';
+        case 'online': return '✅ ONLINE - Ready for Pairing';
+        case 'qr_ready': return '📱 QR READY - Scan to Connect';
+        case 'connecting': return '🔄 CONNECTING...';
+        case 'disconnected': return '❌ DISCONNECTED - Retrying...';
+        default: return '⚙️ UNKNOWN';
+    }
+}
+
+// ==================== WHATSAPP BOT INITIALIZATION ====================
+async function initWhatsApp() {
+    if (isConnecting) {
+        console.log('⚠️ WhatsApp connection already in progress...');
+        return;
+    }
+    
+    console.log('\n' + '═'.repeat(50));
+    console.log(`${CONFIG.COMPANY_NAME} WhatsApp Pairing Service v${CONFIG.VERSION}`);
+    console.log(`📞 Support: ${CONFIG.COMPANY_CONTACT}`);
+    console.log('═'.repeat(50) + '\n');
+    
+    isConnecting = true;
+    connectionStartTime = Date.now();
+    botStatus = 'connecting';
+    lastConnectionUpdate = new Date();
+    
+    try {
+        const authDir = path.join(__dirname, 'auth_info');
+        await fs.ensureDir(authDir);
+        
+        try {
+            const files = await fs.readdir(authDir);
+            const now = Date.now();
+            const oneDayAgo = now - (24 * 60 * 60 * 1000);
+            
+            for (const file of files) {
+                if (file.endsWith('.json')) {
+                    const filePath = path.join(authDir, file);
+                    const stats = await fs.stat(filePath);
+                    
+                    if (stats.mtimeMs < oneDayAgo) {
+                        await fs.unlink(filePath);
+                        console.log(`🗑️ Removed old auth file: ${file}`);
+                    }
+                }
+            }
+        } catch (err) {
+            // Ignore errors during cleanup
+        }
+        
+        const { state, saveCreds } = await useMultiFileAuthState(authDir);
+        
+        let version;
+        try {
+            const versionInfo = await fetchLatestBaileysVersion();
+            version = versionInfo.version;
+            console.log(`📦 Using Baileys version: ${version.join('.')}`);
+        } catch (error) {
+            console.log('⚠️ Could not fetch latest version, using default');
+            version = [6, 0, 0];
+        }
+        
+        const sock = makeWASocket({
+            version,
+            auth: state,
+            logger: pino({ level: 'silent' }),
+            browser: Browsers.ubuntu('Chrome'),
+            printQRInTerminal: false,
+            connectTimeoutMs: CONFIG.CONNECTION_TIMEOUT,
+            keepAliveIntervalMs: 25000,
+            emitOwnEvents: true,
+            defaultQueryTimeoutMs: 0,
+            syncFullHistory: false,
+            markOnlineOnConnect: true,
+            generateHighQualityLinkPreview: true,
+        });
+        
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, qr, lastDisconnect, isNewLogin } = update;
+            lastConnectionUpdate = new Date();
+            
+            if (qr) {
+                currentQR = qr;
+                botStatus = 'qr_ready';
+                autoActivationAttempts++;
+                
+                console.log(`\n⚠️ QR Code Generated (Attempt ${autoActivationAttempts}/${CONFIG.MAX_QR_ATTEMPTS})`);
+                console.log('📱 Please scan the QR code using WhatsApp');
+                
+                try {
+                    qrImageDataUrl = await QRCode.toDataURL(qr, {
+                        errorCorrectionLevel: 'H',
+                        margin: 2,
+                        width: 400,
+                        color: {
+                            dark: '#000000FF',
+                            light: '#FFFFFFFF'
+                        }
+                    });
+                    
+                    console.log('✅ QR Code image generated successfully');
+                    
+                    const sessionInfo = {
+                        createdAt: new Date().toISOString(),
+                        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+                        status: 'qr_ready',
+                        company: CONFIG.COMPANY_NAME,
+                        qrGenerated: true,
+                        attempt: autoActivationAttempts
+                    };
+                    
+                    await fs.writeJson(path.join(authDir, 'session_info.json'), sessionInfo, { spaces: 2 });
+                    
+                } catch (qrError) {
+                    console.error('❌ QR Code generation error:', qrError.message);
+                }
+                
+                if (autoActivationAttempts >= CONFIG.MAX_QR_ATTEMPTS) {
+                    console.log(`\n🚫 Maximum QR attempts reached (${CONFIG.MAX_QR_ATTEMPTS})`);
+                    console.log('📱 Please visit the web interface to scan the QR code');
+                }
+            }
+            
+            if (connection === 'open') {
+                botStatus = 'online';
+                isConnecting = false;
+                autoActivationAttempts = 0;
+                
+                const connectionTime = Date.now() - connectionStartTime;
+                console.log(`\n✅ ${CONFIG.COMPANY_NAME} WhatsApp Bot is ONLINE!`);
+                console.log(`⚡ Connection established in ${connectionTime}ms`);
+                console.log(`📱 Phone: ${sock.user?.id || 'Unknown'}`);
+                console.log(`⚡ Service ready for pairing codes\n`);
+                
+                for (const [code, data] of pairingCodes.entries()) {
+                    if (data.status === 'pending') {
+                        data.status = 'linked';
+                        data.linkedAt = new Date();
+                        pairingCodes.set(code, data);
+                    }
+                }
+                
+                const connectionInfo = {
+                    connectedAt: new Date().toISOString(),
+                    phoneNumber: sock.user?.id || 'unknown',
+                    company: CONFIG.COMPANY_NAME,
+                    version: CONFIG.VERSION
+                };
+                
+                await fs.writeJson(path.join(authDir, 'connection_info.json'), connectionInfo, { spaces: 2 });
+            }
+            
+            if (connection === 'close') {
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                console.log(`\n⚠️ Connection closed. Status code: ${statusCode || 'unknown'}`);
+                
+                botStatus = 'disconnected';
+                isConnecting = false;
+                
+                if (statusCode === DisconnectReason.loggedOut) {
+                    console.log('🔓 Logged out from WhatsApp. Cleaning session...');
+                    
+                    try {
+                        const files = await fs.readdir(authDir);
+                        for (const file of files) {
+                            if (file.endsWith('.json')) {
+                                await fs.unlink(path.join(authDir, file));
+                            }
+                        }
+                        console.log('✅ Session cleaned successfully');
+                    } catch (err) {
+                        console.error('Error cleaning session:', err.message);
+                    }
+                    
+                    console.log('🔄 Restarting connection in 10 seconds...');
+                    setTimeout(() => initWhatsApp(), 10000);
+                } else if (statusCode === DisconnectReason.restartRequired || 
+                          statusCode === DisconnectReason.timedOut ||
+                          statusCode === DisconnectReason.connectionLost) {
+                    console.log('🔄 Reconnecting in 5 seconds...');
+                    setTimeout(() => initWhatsApp(), 5000);
+                } else {
+                    console.log('🔄 Attempting to reconnect in 10 seconds...');
+                    setTimeout(() => initWhatsApp(), 10000);
+                }
+            }
+            
+            if (isNewLogin) {
+                console.log('🆕 New login detected');
+            }
+        });
+        
+        sock.ev.on('creds.update', saveCreds);
+        
+        sock.ev.on('messages.upsert', (m) => {
+            // Message handling can be added here
+        });
+        
+        activeSocket = sock;
+        console.log('🤖 WhatsApp client initialized successfully');
+        
+        return sock;
+        
+    } catch (error) {
+        console.error('❌ WhatsApp initialization failed:', error.message);
+        botStatus = 'disconnected';
+        isConnecting = false;
+        
+        console.log('🔄 Retrying connection in 15 seconds...');
+        setTimeout(() => initWhatsApp(), 15000);
     }
 }
 
@@ -204,6 +405,7 @@ function getStatusText(status) {
 function generateNewPairingCode(phoneNumber = null, country = null) {
     const code = generateAlphanumericCode();
     const displayCode = formatDisplayCode(code);
+    const sessionId = generateSessionId();
     const expiresAt = new Date(Date.now() + CONFIG.CODE_EXPIRY_MINUTES * 60 * 1000);
     
     const codeData = {
@@ -211,147 +413,54 @@ function generateNewPairingCode(phoneNumber = null, country = null) {
         displayCode: displayCode,
         phoneNumber: phoneNumber,
         country: country,
+        sessionId: sessionId,
         status: 'pending',
         createdAt: new Date(),
         expiresAt: expiresAt,
-        serviceStatus: serviceStatus,
+        linkedAt: null,
+        qrData: currentQR,
+        qrImage: qrImageDataUrl,
+        attempts: 0,
+        generatedBy: CONFIG.COMPANY_NAME,
+        botStatus: botStatus,
+        isValid: true
     };
     
     pairingCodes.set(code, codeData);
+    pairingCodes.set(displayCode, codeData);
     lastGeneratedCode = code;
     lastGeneratedDisplayCode = displayCode;
-    totalCodesGenerated++;
     
     console.log(`🔤 Generated pairing code: ${displayCode}`);
     if (phoneNumber) {
         console.log(`📱 For phone: ${phoneNumber}`);
     }
     
-    // Auto-cleanup when code expires
     setTimeout(() => {
         if (pairingCodes.has(code) && pairingCodes.get(code).status === 'pending') {
             pairingCodes.delete(code);
+            pairingCodes.delete(displayCode);
             console.log(`🗑️ Expired code removed: ${displayCode}`);
         }
     }, CONFIG.CODE_EXPIRY_MINUTES * 60 * 1000);
     
-    return codeData;
+    return {
+        code: code,
+        displayCode: displayCode,
+        sessionId: sessionId,
+        expiresAt: expiresAt,
+        country: country,
+        phoneNumber: phoneNumber,
+        status: 'pending'
+    };
 }
 
-// ==================== DATA CLEANUP ====================
-function cleanupExpiredData() {
-    const now = new Date();
-    let cleaned = 0;
-    
-    for (const [code, data] of pairingCodes.entries()) {
-        if (data.expiresAt && new Date(data.expiresAt) < now) {
-            pairingCodes.delete(code);
-            cleaned++;
-        }
-    }
-    
-    // Clean old rate limit data
-    for (const [ip, requests] of rateLimitStore.entries()) {
-        const validRequests = requests.filter(time => 
-            Date.now() - time < CONFIG.RATE_LIMIT_WINDOW_MS
-        );
-        
-        if (validRequests.length === 0) {
-            rateLimitStore.delete(ip);
-        } else {
-            rateLimitStore.set(ip, validRequests);
-        }
-    }
-    
-    if (cleaned > 0) {
-        console.log(`🧹 Cleaned ${cleaned} expired pairing codes`);
-    }
-}
-
-// ==================== EXPRESS SERVER SETUP ====================
-app.use(express.json({ limit: CONFIG.MAX_REQUEST_SIZE }));
-app.use(express.urlencoded({ extended: true, limit: CONFIG.MAX_REQUEST_SIZE }));
-app.use(securityMiddleware);
-
-// ==================== COMPLIANCE & HEALTH ENDPOINTS ====================
-app.get('/compliance', (req, res) => {
-    res.json({
-        service: CONFIG.SERVICE_NAME,
-        provider: CONFIG.COMPANY_NAME,
-        version: CONFIG.SERVICE_VERSION,
-        purpose: "WhatsApp device pairing code generation service",
-        compliance: {
-            whatsapp_terms: "Compliant - Only generates pairing codes for manual entry",
-            data_privacy: "Codes expire after 10 minutes, no permanent storage",
-            gdpr_compliant: CONFIG.GDPR_COMPLIANT,
-            no_automation: "No automated messaging or API interaction",
-            legitimate_use: "Device linking only"
-        },
-        data_handling: {
-            retention: `${CONFIG.DATA_RETENTION_MINUTES} minutes`,
-            storage: "Temporary memory only",
-            encryption: "Codes generated with crypto-secure random",
-            no_pii: "Phone numbers only used for code association"
-        },
-        contact: {
-            email: CONFIG.COMPANY_EMAIL,
-            phone: CONFIG.COMPANY_CONTACT,
-            website: CONFIG.COMPANY_WEBSITE
-        },
-        legal: {
-            terms: CONFIG.TERMS_URL,
-            privacy: CONFIG.PRIVACY_URL,
-            support: CONFIG.SUPPORT_URL
-        }
-    });
-});
-
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'healthy',
-        service: CONFIG.SERVICE_NAME,
-        version: CONFIG.SERVICE_VERSION,
-        uptime: process.uptime(),
-        serviceStatus: serviceStatus,
-        statistics: {
-            totalCodesGenerated: totalCodesGenerated,
-            activeCodes: pairingCodes.size,
-            lastCode: lastGeneratedDisplayCode,
-            serviceStartTime: serviceStartTime
-        },
-        system: {
-            nodeVersion: process.version,
-            platform: process.platform,
-            memory: process.memoryUsage(),
-            timestamp: new Date().toISOString()
-        }
-    });
-});
-
-app.get('/ping', (req, res) => {
-    res.send('pong');
-});
-
-app.get('/ready', (req, res) => {
-    res.json({
-        status: 'ready',
-        message: 'Service is ready to accept connections',
-        timestamp: new Date().toISOString()
-    });
-});
-
-app.get('/live', (req, res) => {
-    res.json({
-        status: 'alive',
-        uptime: process.uptime(),
-        timestamp: new Date().toISOString()
-    });
-});
-
-// ==================== MAIN SERVICE ENDPOINTS ====================
+// ==================== ROUTES ====================
 app.get('/', (req, res) => {
-    const statusColor = getStatusColor(serviceStatus);
-    const statusText = getStatusText(serviceStatus);
+    const statusColor = getStatusColor(botStatus);
+    const statusText = getStatusText(botStatus);
+    const pairingCodesCount = pairingCodes.size;
+    const lastCode = lastGeneratedDisplayCode || 'None';
     
     const html = `
     <!DOCTYPE html>
@@ -359,15 +468,13 @@ app.get('/', (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>${CONFIG.COMPANY_NAME} - ${CONFIG.SERVICE_NAME}</title>
-        <meta name="description" content="${CONFIG.SERVICE_DESCRIPTION}">
-        <meta name="author" content="${CONFIG.COMPANY_NAME}">
+        <title>${CONFIG.COMPANY_NAME} - WhatsApp Pairing Service</title>
         <style>
             * {
                 margin: 0;
                 padding: 0;
                 box-sizing: border-box;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+                font-family: 'Segoe UI', 'Roboto', 'Arial', sans-serif;
             }
             
             body {
@@ -435,17 +542,33 @@ app.get('/', (req, res) => {
                 color: white;
             }
             
-            .compliance-notice {
-                background: #e8f4fd;
-                border-radius: 10px;
-                padding: 15px;
-                margin: 20px 0;
-                border-left: 4px solid #1a73e8;
+            .stats {
+                display: flex;
+                justify-content: space-around;
+                margin-top: 15px;
+                flex-wrap: wrap;
+                gap: 15px;
             }
             
-            .compliance-notice h3 {
+            .stat-item {
+                text-align: center;
+                padding: 15px;
+                background: white;
+                border-radius: 10px;
+                box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+                min-width: 150px;
+            }
+            
+            .stat-number {
+                font-size: 2rem;
+                font-weight: 700;
                 color: #1a73e8;
-                margin-bottom: 10px;
+                margin-bottom: 5px;
+            }
+            
+            .stat-label {
+                color: #666;
+                font-size: 0.9rem;
             }
             
             .pairing-section {
@@ -469,13 +592,28 @@ app.get('/', (req, res) => {
                 margin-bottom: 20px;
             }
             
+            .input-group {
+                display: flex;
+                gap: 10px;
+                margin-bottom: 15px;
+            }
+            
+            .country-select {
+                padding: 12px 15px;
+                border: none;
+                border-radius: 8px;
+                background: white;
+                color: #333;
+                font-weight: 600;
+                min-width: 100px;
+            }
+            
             input[type="tel"] {
-                width: 100%;
-                padding: 15px 20px;
+                flex: 1;
+                padding: 12px 20px;
                 border: none;
                 border-radius: 8px;
                 font-size: 1rem;
-                margin-bottom: 15px;
             }
             
             .example {
@@ -511,9 +649,44 @@ app.get('/', (req, res) => {
                 color: white;
             }
             
+            .btn-secondary {
+                background: #ffc107;
+                color: #333;
+            }
+            
+            .btn-success {
+                background: #28a745;
+                color: white;
+            }
+            
             .btn:hover {
                 transform: translateY(-2px);
                 box-shadow: 0 10px 20px rgba(0,0,0,0.2);
+            }
+            
+            .qr-section {
+                background: white;
+                border-radius: 15px;
+                padding: 30px;
+                margin-bottom: 30px;
+                text-align: center;
+                border: 2px solid #1a73e8;
+                display: none;
+            }
+            
+            .qr-title {
+                color: #1a73e8;
+                font-size: 1.5rem;
+                margin-bottom: 20px;
+            }
+            
+            #qrImage {
+                max-width: 300px;
+                width: 100%;
+                height: auto;
+                border-radius: 10px;
+                border: 2px solid #eee;
+                margin: 0 auto 20px;
             }
             
             .code-display-section {
@@ -574,20 +747,6 @@ app.get('/', (req, res) => {
                 padding-top: 20px;
             }
             
-            .compliance-links {
-                margin-top: 15px;
-            }
-            
-            .compliance-links a {
-                color: #1a73e8;
-                text-decoration: none;
-                margin: 0 10px;
-            }
-            
-            .compliance-links a:hover {
-                text-decoration: underline;
-            }
-            
             .notification {
                 position: fixed;
                 top: 20px;
@@ -624,6 +783,14 @@ app.get('/', (req, res) => {
                 .btn {
                     min-width: 100%;
                 }
+                
+                .input-group {
+                    flex-direction: column;
+                }
+                
+                .country-select {
+                    width: 100%;
+                }
             }
         </style>
     </head>
@@ -632,36 +799,70 @@ app.get('/', (req, res) => {
             <div class="header">
                 <img src="${CONFIG.LOGO_URL}" alt="${CONFIG.COMPANY_NAME} Logo" class="logo">
                 <h1>${CONFIG.COMPANY_NAME}</h1>
-                <p class="subtitle">${CONFIG.SERVICE_NAME} v${CONFIG.SERVICE_VERSION}</p>
+                <p class="subtitle">WhatsApp Pairing Code Generator v${CONFIG.VERSION}</p>
             </div>
             
             <div class="status-container">
-                <div class="status-badge">${statusText}</div>
-                <div class="compliance-notice">
-                    <h3>Compliance Notice</h3>
-                    <p>${CONFIG.COMPLIANCE_NOTICE}</p>
-                    <p>This service only generates pairing codes for legitimate WhatsApp device linking. No automated messaging or API interaction.</p>
+                <div class="status-badge" id="statusBadge">${statusText}</div>
+                <div class="stats">
+                    <div class="stat-item">
+                        <div class="stat-number" id="pairingCount">${pairingCodesCount}</div>
+                        <div class="stat-label">Active Codes</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" id="lastCode">${lastCode}</div>
+                        <div class="stat-label">Last Code</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" id="qrAttempts">${autoActivationAttempts}</div>
+                        <div class="stat-label">QR Attempts</div>
+                    </div>
                 </div>
             </div>
             
             <div class="pairing-section">
                 <h2 class="pairing-title">Generate WhatsApp Pairing Code</h2>
                 <div class="phone-input-container">
-                    <input type="tel" id="phoneNumber" placeholder="Enter phone number (e.g., 723278526)" value="${CONFIG.DEFAULT_PHONE_EXAMPLE}">
-                    <p class="example">Example: ${CONFIG.DEFAULT_PHONE_EXAMPLE} (Kenya), 9876543210 (India), 1234567890 (USA)</p>
+                    <div class="input-group">
+                        <select class="country-select" id="countryCode">
+                            <option value="254">🇰🇪 +254 (Kenya)</option>
+                            <option value="255">🇹🇿 +255 (Tanzania)</option>
+                            <option value="256">🇺🇬 +256 (Uganda)</option>
+                            <option value="1">🇺🇸 +1 (USA/Canada)</option>
+                            <option value="44">🇬🇧 +44 (UK)</option>
+                            <option value="91">🇮🇳 +91 (India)</option>
+                            <option value="234">🇳🇬 +234 (Nigeria)</option>
+                            <option value="27">🇿🇦 +27 (South Africa)</option>
+                            <option value="other">Other Country</option>
+                        </select>
+                        <input type="tel" id="phoneNumber" placeholder="723278526" value="723278526">
+                    </div>
+                    <div id="customCountryCode" style="display: none; margin-top: 10px;">
+                        <input type="text" id="customCode" placeholder="Enter country code (e.g., 33 for France)" style="width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #ddd;">
+                    </div>
+                    <p class="example">Example: 723278526 (Kenya), 9876543210 (India), 1234567890 (USA)</p>
                 </div>
                 <div class="buttons">
                     <button class="btn btn-primary" onclick="generatePairingCode()">
                         <span>🔢</span> Generate Pairing Code
                     </button>
-                    <button class="btn btn-primary" onclick="copyToClipboard()">
+                    <button class="btn btn-secondary" onclick="showQRCode()">
+                        <span>📱</span> Show QR Code
+                    </button>
+                    <button class="btn btn-success" onclick="copyToClipboard()">
                         <span>📋</span> Copy Code
                     </button>
                 </div>
             </div>
             
+            <div class="qr-section" id="qrSection">
+                <h3 class="qr-title">Scan QR Code</h3>
+                <img id="qrImage" alt="WhatsApp QR Code">
+                <p>Open WhatsApp → Linked Devices → Scan QR Code</p>
+            </div>
+            
             <div class="code-display-section" id="codeDisplaySection">
-                <h3 class="pairing-title">Your Pairing Code</h3>
+                <h3 class="qr-title">Your Pairing Code</h3>
                 <div class="code-display" id="pairingCodeDisplay">0000-0000</div>
                 <p class="code-info" id="codeInfo">
                     Code expires in <span id="expiryTimer">10:00</span>
@@ -678,22 +879,15 @@ app.get('/', (req, res) => {
                     <li>Go to: <strong>Settings → Linked Devices → Link a Device</strong></li>
                     <li>Tap <strong>"Use pairing code instead"</strong></li>
                     <li>Enter the 8-digit code shown above</li>
-                    <li>Your WhatsApp will be linked to this device</li>
+                    <li>Your WhatsApp will be linked to this service</li>
                 </ol>
-                <p><strong>Note:</strong> The pairing code is valid for ${CONFIG.CODE_EXPIRY_MINUTES} minutes only and will be automatically deleted.</p>
+                <p><strong>Note:</strong> The pairing code is valid for ${CONFIG.CODE_EXPIRY_MINUTES} minutes only.</p>
             </div>
             
             <div class="footer">
                 <p>⚡ Powered by <a href="${CONFIG.COMPANY_WEBSITE}" target="_blank">${CONFIG.COMPANY_NAME}</a></p>
                 <p>📞 Support: <a href="tel:${CONFIG.COMPANY_CONTACT}">${CONFIG.COMPANY_CONTACT}</a> | 📧 <a href="mailto:${CONFIG.COMPANY_EMAIL}">${CONFIG.COMPANY_EMAIL}</a></p>
-                <div class="compliance-links">
-                    <a href="${CONFIG.TERMS_URL}" target="_blank">Terms of Service</a> | 
-                    <a href="${CONFIG.PRIVACY_URL}" target="_blank">Privacy Policy</a> | 
-                    <a href="${CONFIG.SUPPORT_URL}" target="_blank">Support</a>
-                </div>
-                <p style="margin-top: 15px; font-size: 0.8rem; color: #999;">
-                    This service complies with WhatsApp's Terms of Service and only generates pairing codes for legitimate device linking.
-                </p>
+                <p>© ${new Date().getFullYear()} ${CONFIG.COMPANY_NAME}. All rights reserved.</p>
             </div>
         </div>
         
@@ -704,15 +898,36 @@ app.get('/', (req, res) => {
             let currentPhone = '';
             let expiryInterval = null;
             
-            // Phone number input validation
+            document.getElementById('countryCode').addEventListener('change', function(e) {
+                const customCodeDiv = document.getElementById('customCountryCode');
+                if (e.target.value === 'other') {
+                    customCodeDiv.style.display = 'block';
+                } else {
+                    customCodeDiv.style.display = 'none';
+                }
+            });
+            
             document.getElementById('phoneNumber').addEventListener('input', function(e) {
-                let value = e.target.value.replace(/\D/g, '');
+                let value = e.target.value.replace(/\\D/g, '');
                 e.target.value = value;
             });
             
             async function generatePairingCode() {
+                const countrySelect = document.getElementById('countryCode');
                 const phoneInput = document.getElementById('phoneNumber');
-                const phone = phoneInput.value.replace(/\D/g, '');
+                const customCodeInput = document.getElementById('customCode');
+                
+                let countryCode = countrySelect.value;
+                if (countryCode === 'other') {
+                    countryCode = customCodeInput.value.replace(/\\D/g, '');
+                    if (!countryCode) {
+                        showNotification('❌ Please enter a country code', 'error');
+                        customCodeInput.focus();
+                        return;
+                    }
+                }
+                
+                const phone = phoneInput.value.replace(/\\D/g, '');
                 
                 if (!phone) {
                     showNotification('❌ Please enter your phone number', 'error');
@@ -720,23 +935,21 @@ app.get('/', (req, res) => {
                     return;
                 }
                 
-                if (phone.length < 8) {
-                    showNotification('❌ Phone number must be at least 8 digits', 'error');
+                if (phone.length < 5) {
+                    showNotification('❌ Phone number too short', 'error');
                     phoneInput.focus();
                     return;
                 }
                 
-                const fullNumber = '+' + phone;
+                const fullNumber = '+' + countryCode + phone;
                 
                 try {
-                    const response = await fetch('/api/generate-code', {
+                    const response = await fetch('/generate-code', {
                         method: 'POST',
-                        headers: { 
-                            'Content-Type': 'application/json',
-                            'X-Requested-With': 'XMLHttpRequest'
-                        },
+                        headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ 
-                            phoneNumber: fullNumber
+                            phoneNumber: fullNumber,
+                            countryCode: countryCode
                         })
                     });
                     
@@ -746,20 +959,21 @@ app.get('/', (req, res) => {
                         currentCode = data.displayCode;
                         currentPhone = data.phoneNumber;
                         
-                        // Update display
                         document.getElementById('pairingCodeDisplay').textContent = currentCode;
                         document.getElementById('codeDisplaySection').style.display = 'block';
+                        document.getElementById('qrSection').style.display = 'none';
                         
-                        // Update info
+                        const countryFlag = data.country ? \` (\${data.country})\` : '';
                         document.getElementById('codeInfo').innerHTML = \`
-                            Generated for: <strong>\${currentPhone}</strong><br>
+                            Generated for: <strong>\${currentPhone}\${countryFlag}</strong><br>
                             Expires in: <span id="expiryTimer">10:00</span>
                         \`;
                         
-                        // Start expiry timer
                         if (data.expiresAt) {
                             startExpiryTimer(data.expiresAt);
                         }
+                        
+                        updateStats();
                         
                         showNotification(\`✅ Pairing code generated: \${currentCode}\`, 'success');
                     } else {
@@ -771,9 +985,33 @@ app.get('/', (req, res) => {
                 }
             }
             
+            async function showQRCode() {
+                try {
+                    const response = await fetch('/getqr', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({})
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.success && data.qrImage) {
+                        document.getElementById('qrImage').src = data.qrImage;
+                        document.getElementById('qrSection').style.display = 'block';
+                        document.getElementById('codeDisplaySection').style.display = 'none';
+                        showNotification('✅ QR Code loaded successfully', 'success');
+                    } else {
+                        showNotification('⚠️ ' + (data.message || 'QR code not available yet'), 'warning');
+                    }
+                } catch (error) {
+                    console.error('Error:', error);
+                    showNotification('❌ Error loading QR code', 'error');
+                }
+            }
+            
             function copyToClipboard() {
                 if (!currentCode) {
-                    showNotification('❌ No code to copy. Generate a code first.', 'warning');
+                    showNotification('❌ No code to copy', 'warning');
                     return;
                 }
                 
@@ -811,11 +1049,30 @@ app.get('/', (req, res) => {
                 expiryInterval = setInterval(updateTimer, 1000);
             }
             
+            async function updateStats() {
+                try {
+                    const response = await fetch('/status');
+                    const data = await response.json();
+                    
+                    const statusBadge = document.getElementById('statusBadge');
+                    statusBadge.textContent = data.statusText || 'Unknown';
+                    statusBadge.style.backgroundColor = data.statusColor || '#6c757d';
+                    
+                    document.getElementById('pairingCount').textContent = data.pairingCodes || 0;
+                    if (data.lastCode) {
+                        document.getElementById('lastCode').textContent = data.lastCode;
+                    }
+                    document.getElementById('qrAttempts').textContent = data.qrAttempts || 0;
+                    
+                } catch (error) {
+                    console.log('Status update failed:', error);
+                }
+            }
+            
             function showNotification(message, type) {
                 const notification = document.getElementById('notification');
                 notification.textContent = message;
                 
-                // Set color based on type
                 if (type === 'success') {
                     notification.style.background = '#28a745';
                 } else if (type === 'error') {
@@ -829,11 +1086,13 @@ app.get('/', (req, res) => {
                 
                 notification.style.display = 'block';
                 
-                // Auto-hide after 3 seconds
                 setTimeout(() => {
                     notification.style.display = 'none';
                 }, 3000);
             }
+            
+            setInterval(updateStats, 5000);
+            updateStats();
         </script>
     </body>
     </html>
@@ -842,16 +1101,15 @@ app.get('/', (req, res) => {
     res.send(html);
 });
 
-// ==================== API ENDPOINTS ====================
-app.post('/api/generate-code', (req, res) => {
+// Generate pairing code endpoint
+app.post('/generate-code', async (req, res) => {
     try {
-        const { phoneNumber } = req.body;
+        const { phoneNumber, countryCode } = req.body;
         
         if (!phoneNumber) {
             return res.status(400).json({ 
                 success: false, 
-                message: 'Phone number is required',
-                code: 'PHONE_REQUIRED'
+                message: 'Phone number is required' 
             });
         }
         
@@ -860,169 +1118,218 @@ app.post('/api/generate-code', (req, res) => {
         if (!validation.isValid) {
             return res.status(400).json({ 
                 success: false, 
-                message: validation.error,
-                code: validation.code
+                message: validation.error 
             });
         }
         
-        // Check rate limiting for this phone number
-        const phoneRequests = pairingCodes.get(validation.formatted) || [];
-        const recentRequests = phoneRequests.filter(
-            req => Date.now() - req.timestamp < 5 * 60 * 1000 // 5 minutes
+        const codeData = generateNewPairingCode(
+            validation.formatted,
+            validation.country
         );
-        
-        if (recentRequests.length >= 3) {
-            return res.status(429).json({
-                success: false,
-                message: 'Too many requests for this phone number. Please wait 5 minutes.',
-                code: 'RATE_LIMITED'
-            });
-        }
-        
-        const codeData = generateNewPairingCode(validation.formatted, validation.country);
-        
-        // Track request for this phone number
-        phoneRequests.push({ 
-            timestamp: Date.now(), 
-            code: codeData.code 
-        });
-        pairingCodes.set(validation.formatted, phoneRequests.slice(-10)); // Keep last 10
         
         res.json({ 
             success: true,
             code: codeData.code,
             displayCode: codeData.displayCode,
             phoneNumber: validation.formatted,
+            international: validation.international,
             country: validation.country,
+            countryCode: validation.countryCode,
+            sessionId: codeData.sessionId,
             expiresAt: codeData.expiresAt,
-            message: 'Pairing code generated successfully',
-            notice: 'This code is for legitimate WhatsApp device linking only.'
+            status: codeData.status,
+            message: `${CONFIG.COMPANY_NAME}: Pairing code generated successfully!`,
         });
         
     } catch (error) {
         console.error('Error generating pairing code:', error);
         res.status(500).json({ 
             success: false, 
-            message: 'Internal server error while generating code',
-            code: 'SERVER_ERROR'
+            message: 'Internal server error while generating code' 
         });
     }
 });
 
-app.get('/api/verify-code/:code', (req, res) => {
+// Get QR code endpoint
+app.post('/getqr', async (req, res) => {
     try {
-        const { code } = req.params;
-        const codeData = pairingCodes.get(code);
-        
-        if (!codeData) {
-            return res.json({
-                valid: false,
-                message: 'Invalid or expired code',
-                code: 'INVALID_CODE'
+        if (botStatus === 'qr_ready' && qrImageDataUrl) {
+            res.json({
+                success: true,
+                qrImage: qrImageDataUrl,
+                message: 'Scan this QR code in WhatsApp',
+                status: botStatus
+            });
+        } else {
+            res.status(200).json({ 
+                success: false, 
+                message: 'QR code not available yet. Please wait for connection...',
+                status: botStatus,
+                qrAttempts: autoActivationAttempts,
+                maxAttempts: CONFIG.MAX_QR_ATTEMPTS
             });
         }
-        
-        if (new Date(codeData.expiresAt) < new Date()) {
-            pairingCodes.delete(code);
-            return res.json({
-                valid: false,
-                message: 'Code has expired',
-                code: 'EXPIRED_CODE'
-            });
-        }
-        
-        res.json({
-            valid: true,
-            phoneNumber: codeData.phoneNumber,
-            createdAt: codeData.createdAt,
-            expiresAt: codeData.expiresAt,
-            code: 'VALID_CODE'
-        });
-        
     } catch (error) {
-        res.status(500).json({
-            valid: false,
-            message: 'Verification error',
-            code: 'VERIFICATION_ERROR'
+        console.error('Error getting QR code:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Error getting QR code' 
         });
     }
 });
 
-app.get('/api/status', (req, res) => {
+// Status endpoint
+app.get('/status', (req, res) => {
     res.json({
-        service: CONFIG.SERVICE_NAME,
-        status: serviceStatus,
-        version: CONFIG.SERVICE_VERSION,
-        statistics: {
-            totalCodesGenerated: totalCodesGenerated,
-            activeCodes: pairingCodes.size,
-            lastCode: lastGeneratedDisplayCode,
-            uptime: process.uptime()
-        },
-        compliance: {
-            whatsapp_terms: 'Compliant',
-            data_privacy: 'Codes expire after 10 minutes',
-            gdpr: CONFIG.GDPR_COMPLIANT,
-            purpose: 'Device linking only'
-        }
+        status: botStatus,
+        statusText: getStatusText(botStatus),
+        statusColor: getStatusColor(botStatus),
+        pairingCodes: pairingCodes.size,
+        lastCode: lastGeneratedDisplayCode,
+        qrAttempts: autoActivationAttempts,
+        maxQrAttempts: CONFIG.MAX_QR_ATTEMPTS,
+        qrReady: botStatus === 'qr_ready',
+        online: botStatus === 'online',
+        company: CONFIG.COMPANY_NAME,
+        version: CONFIG.VERSION,
+        lastConnectionUpdate: lastConnectionUpdate,
+        uptime: process.uptime()
     });
 });
 
-// ==================== ERROR HANDLING ====================
-app.use((req, res, next) => {
-    res.status(404).json({
-        success: false,
-        message: 'Resource not found',
-        path: req.path,
-        code: 'NOT_FOUND'
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: 'healthy',
+        service: 'WhatsApp Pairing Service',
+        company: CONFIG.COMPANY_NAME,
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
+        botStatus: botStatus
     });
 });
 
+// Verify pairing code endpoint
+app.post('/verify-code', (req, res) => {
+    const { code } = req.body;
+    
+    if (!code) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'Code is required' 
+        });
+    }
+    
+    const cleanCode = code.replace(/-/g, '').toUpperCase();
+    const codeData = pairingCodes.get(cleanCode) || pairingCodes.get(code);
+    
+    if (!codeData) {
+        return res.json({ 
+            success: false, 
+            message: 'Invalid pairing code' 
+        });
+    }
+    
+    if (codeData.status === 'expired') {
+        return res.json({ 
+            success: false, 
+            message: 'This pairing code has expired' 
+        });
+    }
+    
+    if (codeData.status === 'linked') {
+        return res.json({ 
+            success: true, 
+            message: 'Pairing code already linked',
+            data: codeData
+        });
+    }
+    
+    res.json({ 
+        success: true, 
+        message: 'Valid pairing code',
+        data: codeData
+    });
+});
+
+// List all active codes (admin endpoint)
+app.get('/admin/codes', (req, res) => {
+    const codes = Array.from(pairingCodes.entries()).map(([code, data]) => ({
+        code: code,
+        displayCode: data.displayCode,
+        phoneNumber: data.phoneNumber,
+        status: data.status,
+        createdAt: data.createdAt,
+        expiresAt: data.expiresAt,
+        linkedAt: data.linkedAt
+    }));
+    
+    res.json({
+        success: true,
+        count: codes.length,
+        codes: codes
+    });
+});
+
+// Error handling middleware
 app.use((err, req, res, next) => {
-    console.error('Server error:', err);
-    res.status(500).json({
-        success: false,
-        message: 'Internal server error',
-        code: 'INTERNAL_ERROR'
+    console.error(err.stack);
+    res.status(500).json({ 
+        success: false, 
+        message: 'Internal Server Error',
+        error: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
+});
+
+// 404 handler
+app.use((req, res) => {
+    res.status(404).json({ 
+        success: false, 
+        message: 'Endpoint not found' 
     });
 });
 
 // ==================== START SERVER ====================
 const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log('='.repeat(70));
-    console.log(`${CONFIG.COMPANY_NAME} - ${CONFIG.SERVICE_NAME}`);
-    console.log(`Version: ${CONFIG.SERVICE_VERSION}`);
-    console.log(`Server running on port ${PORT}`);
-    console.log(`Health check: http://localhost:${PORT}/health`);
-    console.log(`Compliance: http://localhost:${PORT}/compliance`);
-    console.log('='.repeat(70));
-    console.log('COMPLIANCE INFORMATION:');
-    console.log(`- Service: ${CONFIG.SERVICE_DESCRIPTION}`);
-    console.log(`- WhatsApp Terms: Compliant - Only generates pairing codes`);
-    console.log(`- Data Privacy: Codes expire after ${CONFIG.CODE_EXPIRY_MINUTES} minutes`);
-    console.log(`- No Automation: Manual code entry only`);
-    console.log(`- GDPR Compliant: ${CONFIG.GDPR_COMPLIANT ? 'Yes' : 'No'}`);
-    console.log('='.repeat(70));
-    console.log('Service is ready and compliant with Replit AI Agent policies.');
+    console.log('\n' + '='.repeat(60));
+    console.log(`🚀 ${CONFIG.COMPANY_NAME} WhatsApp Pairing Service v${CONFIG.VERSION}`);
+    console.log(`🌐 Server running on port ${PORT}`);
+    console.log(`📱 Visit: http://localhost:${PORT}`);
+    console.log(`⚡ Auto-Activation: ${CONFIG.AUTO_ACTIVATED ? 'ENABLED' : 'DISABLED'}`);
+    console.log(`📞 Support: ${CONFIG.COMPANY_CONTACT}`);
+    console.log('='.repeat(60) + '\n');
 });
 
-// ==================== MAINTENANCE ====================
-setInterval(cleanupExpiredData, CONFIG.CLEANUP_INTERVAL);
+// Initialize WhatsApp connection
+setTimeout(() => {
+    console.log('Initializing WhatsApp connection...');
+    initWhatsApp();
+}, 2000);
 
-// Graceful shutdown
+// Cleanup expired codes every minute
+setInterval(cleanupExpiredCodes, CONFIG.CLEANUP_INTERVAL);
+
+// Graceful shutdown handler
 process.on('SIGINT', () => {
-    console.log('\n' + '='.repeat(70));
-    console.log('Shutting down service gracefully...');
-    console.log('Cleaning up temporary data...');
+    console.log(`\n🛑 ${CONFIG.COMPANY_NAME} - Shutting down gracefully...`);
     
-    // Clear all data
-    pairingCodes.clear();
-    rateLimitStore.clear();
+    if (activeSocket) {
+        console.log('Closing WhatsApp connection...');
+        activeSocket.end();
+    }
     
     server.close(() => {
-        console.log('Server closed successfully');
-        console.log('All temporary data has been cleared');
-        console.log('='.repeat(70));
+        console.log('✅ Server closed');
+        console.log('👋 Goodbye!');
         process.exit(0);
     });
+});
+
+// Handle uncaught errors
+process.on('uncaughtException', (error) => {
+    console.error('❌ Uncaught Exception:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
 });
